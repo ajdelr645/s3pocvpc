@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: VPC and EC2 for secure S3 processing job
+Description: VPC and EC2 for secure sdfdgdfgdfgdfgd S3 processing job
 Parameters:
   VPCCIDR:
     Description: VPCCIDR
