@@ -14,7 +14,7 @@ Parameters:
     Type: String
     Default: 50
   CopyPath:
-    Description: Please enter the path in EC2 from where files to be copied to S3
+    Description: Please enter the path in dfbdgdfgdgfg EC2 from where files to be copied to S3
     Type: String
     Default: /tmp   #or /home/ec2-user/<path>
   BucketName: #primary bucket
