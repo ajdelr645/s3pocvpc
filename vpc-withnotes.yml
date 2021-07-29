@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: VPC and EC2 for secure S3 processing job
+Parameters:
+  VPCCIDR:
+    Description: VPCCIDR
+    Type: String
+    Default: 10.16.0.0/16 #65536 available ips. minimum range is xxx.xxx.xxx.xxx/28
+  SubnetWEBACIDR: #the public subnet
+    Description: SubnetA CIDR
+    Type: String
+    Default: 10.16.0.0/20
+  EBSsize:
+    Description: Size of EBS Volume
+    Type: String
+    Default: 50
+  CopyPath:
+    Description: Please enter the path in EC2 from where files to be copied to S3
+    Type: String
+    Default: /tmp   #or /home/ec2-user/<path>
+  BucketName: #primary bucket
+    Description: Name of the S3 bucket
+    Type: String
+
+
+  LatestAmiId:
+    Description: AMI for EC2 Instance (default is latest AmaLinux2)
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'    #this means the value will be stored in SSM.
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'    #this is the image id
+
+#VPC
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Ref: VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: vpc-igw   #the tag that will show in the console
+  InternetGatewayAttachment:  #the service that attached the IGW to VPC
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  RouteTableWeb:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId:
+        Ref: VPC
+  RouteTableWebDefaultIPv4:   #set outbound connection in the VPC. All destination other than local with pass IGW.
+    Type: 'AWS::EC2::Route'   #all VPCs with public subnet must have this route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: RouteTableWeb
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId:
+        Ref: InternetGateway
+  RouteTableAssociationWebA:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetWEBA
+      RouteTableId:
+        Ref: RouteTableWeb
+
+  SubnetWEBA: #the actual public subnet. Will cover only 1 AZ
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref SubnetWEBACIDR
+      MapPublicIpOnLaunch: true
+
+
+
+
+  NewVolume: #the actual EBS volume
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: !Ref EBSsize
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+    DeletionPolicy: Snapshot
+
+  S3Endpoint: #no role, just policies
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:Get*'
+              - 's3:List*'
+              - 's3:Put*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BucketName}/*'
+      RouteTableIds:
+        - !Ref RouteTableWeb
+
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'    #the actual gateway endpoint
+      VpcId: !Ref VPC
+
+  #Ec2 instance role
+  EC2InstanceRole:   #Role of the Instance Profile
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:  #to get temporary credentials. Access key and secret will be stored in ec2 metadata. (rotated)
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:Get*'
+                  - 's3:List*'
+                  - 's3:Put*'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action: #line 141-146 is for accessing the EC2 via SSH session manager
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:OpenDataChannel'
+                  - 'ssm:UpdateInstanceInformation'
+                  - 'kms:*'
+                Resource:
+                  - '*'
+  EC2S3InstanceProfile: #the actual instance profile
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+#EC2 instance in public subnet
+  PublicEC2:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT2M   #2 minutes timeout
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref EC2S3InstanceProfile
+      SubnetId: !Ref SubnetWEBA
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Volumes:
+        - Device: "/dev/sdf" #mounts this path to the EBS
+          VolumeId: !Ref NewVolume  #the actual EBS
+
+      #userdata script for S3 transfer job
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # System Updates
+          #line 183: for testing purposes. it create ten files in /tmp. Only for testing can be removed
+          #line 184: default command to create cron job
+          #line 185: Job will run 4x a day and copy contents of copypath(/tmp) to the bucket
+          #line 186: Will delete all the contents of copypath after it is copied (will execute once a day)
+
+          cd /${CopyPath} && touch file{20..30}.txt
+          crontab<<EOF
+          * */6 * * * aws s3 cp ${CopyPath} s3://${BucketName} --sse aws:kms --recursive
+          0 8 * * * rm -rf ${CopyPath}/*
+          EOF
+
+
+          # STEP 10 SIGNAL FINISH OF INSTALL & CONFIG  - response to CFN that user data script is deployed in ec2
+          # do this whenever you use UserData in EC2
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource PublicEC2 --region ${AWS::Region}
+  InstanceSecurityGroup:  #allows SSH from anywhere. Will not need this if you use SSM to connect to EC2
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable SSH access via port 22 IPv4 & v6
+      SecurityGroupIngress:
+        - Description: 'Allow SSH IPv4 IN'
+          IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'

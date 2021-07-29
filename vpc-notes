@@ -1,0 +1,10 @@
+
+
+
+
+# TO connect to the EC2 instance using CLI
+aws ssm start-session --target instance-id
+aws ssm start-session --target i-07acca4945f84fff4
+
+#SOURCE OF THE COMMAND ABOVE
+https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ssm/start-session.html

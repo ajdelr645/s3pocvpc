@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: VPC and EC2 for secure S3 processing job
+Parameters:
+  VPCCIDR:
+    Description: VPCCIDR
+    Type: String
+    Default: 10.16.0.0/16
+  SubnetWEBACIDR:
+    Description: SubnetA CIDR
+    Type: String
+    Default: 10.16.0.0/20
+  EBSsize:
+    Description: Size of EBS Volume
+    Type: String
+    Default: 50
+  CopyPath:
+    Description: Please enter the path in EC2 from where files to be copied to S3
+    Type: String
+    Default: /tmp
+  BucketName:
+    Description: Name of the S3 bucket
+    Type: String
+    Default: "alain-s3-origbuck-366443085567-dev"
+ 
+
+
+  LatestAmiId:
+    Description: AMI for EC2 Instance (default is latest AmaLinux2)
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Ref: VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: vpc-igw
+  InternetGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  RouteTableWeb:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId:
+        Ref: VPC
+  RouteTableWebDefaultIPv4:
+    Type: 'AWS::EC2::Route'
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: RouteTableWeb
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId:
+        Ref: InternetGateway
+  RouteTableAssociationWebA:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetWEBA
+      RouteTableId:
+        Ref: RouteTableWeb
+
+  SubnetWEBA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref SubnetWEBACIDR
+      MapPublicIpOnLaunch: true
+
+
+
+
+  NewVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: !Ref EBSsize
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+    DeletionPolicy: Snapshot
+
+  S3Endpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:Get*'
+              - 's3:List*'
+              - 's3:Put*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BucketName}/*'
+      RouteTableIds:
+        - !Ref RouteTableWeb
+
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+
+  EC2InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:Get*'
+                  - 's3:List*'
+                  - 's3:Put*'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:OpenDataChannel'
+                  - 'ssm:UpdateInstanceInformation'
+                  - 'kms:*'
+                Resource:
+                  - '*'
+  EC2S3InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  PublicEC2:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT2M
+    Properties:
+      InstanceType: "t2.micro"
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref EC2S3InstanceProfile
+      SubnetId: !Ref SubnetWEBA
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Volumes:
+        - Device: "/dev/sdf"
+          VolumeId: !Ref NewVolume
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # System Update
+          cd ${CopyPath} && touch file{20..30}.txt
+          crontab<<EOF
+          * */6 * * * aws s3 cp ${CopyPath} s3://${BucketName} --sse aws:kms --recursive
+          0 8 * * * rm -rf ${CopyPath}/*
+          EOF
+          # STEP 10 SIGNAL FINISH OF INSTALL & CONFIG
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource PublicEC2 --region ${AWS::Region}
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable SSH access via port 22 IPv4 & v6
+      SecurityGroupIngress:
+        - Description: 'Allow SSH IPv4 IN'
+          IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
