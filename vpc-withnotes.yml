@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: VPC and EC2 for secure S3 processing job
+Description: VPC and EC2 for secure S3 processing job.
 Parameters:
   VPCCIDR:
     Description: VPCCIDR
@@ -14,7 +14,7 @@ Parameters:
     Type: String
     Default: 50
   CopyPath:
-    Description: Please enter the path in dfbdgdfgdgfg EC2 from where files to be copied to S3
+    Description: Please enter path in EC2 from where files to be copied to S3
     Type: String
     Default: /tmp   #or /home/ec2-user/<path>
   BucketName: #primary bucket
